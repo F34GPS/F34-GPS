@@ -1,137 +1,170 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
-import sqlite3, time, os
+# telem.py — dual-channel receiver (F-34 trades + Heimdall market)
+# FastAPI + CSV append; optional XLSX export if pandas/openpyxl present.
 
-DB_PATH   = os.environ.get("TELEM_DB", "telem.db")
-URL_TOKEN = os.environ.get("TELEM_URL_TOKEN", "set-a-long-random-token")
-BODY_SEC  = os.environ.get("TELEM_SECRET",       "CHANGE_ME")
+import os, io, csv, time
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi.responses import PlainTextResponse, StreamingResponse
 
-app = FastAPI()
+# --- config via Render environment variables ---
+URL_TOKEN   = os.environ.get("TELEM_URL_TOKEN",   "CHANGE_ME_URL_TOKEN")
+SHARED_SEC  = os.environ.get("TELEM_SHARED_SECRET","CHANGE_ME_SHARED_SECRET")
+DATA_DIR    = os.environ.get("DATA_DIR", "/data")  # mount a Persistent Disk here on Render
+os.makedirs(DATA_DIR, exist_ok=True)
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    # Trades (from strategy order comments: TELEM_TRADE)
-    conn.execute("""CREATE TABLE IF NOT EXISTS trades(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_ms INTEGER NOT NULL,
-        sym TEXT NOT NULL, tf TEXT NOT NULL, verb TEXT NOT NULL,  -- EL/ES/XL/XS/XA
-        persona TEXT, ag INTEGER, al REAL, hr REAL, ds REAL, sl REAL,
-        mx TEXT, rs TEXT, wr20 REAL, raw TEXT
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_sym_tf_ts ON trades(sym, tf, ts_ms)")
-    # Market snapshots (from Heimdall / PSY)
-    conn.execute("""CREATE TABLE IF NOT EXISTS market(
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_ms INTEGER NOT NULL,
-        sym TEXT NOT NULL, tf TEXT NOT NULL,
-        al REAL, hr REAL, adx REAL, bb REAL, liq REAL, spr REAL,
-        mx TEXT, rg TEXT, sess TEXT, fp TEXT, raw TEXT
-    )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_market_sym_tf_ts ON market(sym, tf, ts_ms)")
-    return conn
+# --- optional pandas for XLSX export ---
+try:
+    import pandas as pd
+    HAVE_PD = True
+except Exception:
+    HAVE_PD = False
 
-def parse_pipe(raw: str, expect_prefix: str):
-    raw = raw.strip()
-    if not raw.startswith(expect_prefix + "|"):
-        raise ValueError(f"bad prefix: expected {expect_prefix}")
-    out = {}
-    # First chunk is the prefix, the rest k=v or tokens
-    for chunk in raw.split("|")[1:]:
-        if "=" in chunk:
-            k, v = chunk.split("=", 1)
-            out[k] = v
-    return out
+app = FastAPI(title="F34GPS", version="1.1")
 
-@app.get("/health")
-def health():
-    return {"ok": True, "db": DB_PATH}
+def utc_ms() -> int:
+    return int(time.time() * 1000)
 
-# -------- TELEM (orders) --------
-@app.post("/telem")
-async def telem_ingest(request: Request, token: str):
+def today_tag() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+def csv_path(table: str) -> str:
+    return os.path.join(DATA_DIR, f"{table}_{today_tag()}.csv")
+
+def append_row(path: str, headers: list[str], row: list):
+    file_exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        if not file_exists:
+            w.writerow(headers)
+        w.writerow(row)
+
+def parse_pipe(body: str) -> tuple[str, dict]:
+    """
+    Returns (kind, fields)
+    kind: 'trade' for EL|ES|XL|XS|XA|..., 'market' for PSY|...
+    """
+    body = body.strip()
+    if not body:
+        raise ValueError("empty body")
+
+    if body.startswith(("EL|","ES|","XL|","XS|","XA|","TELEM|")):
+        kind = "trade"
+        # first token is the verb (EL/ES/XL/XS/XA)
+        parts = body.split("|")
+        fields = {"verb": parts[0]}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                fields[k] = v
+        return kind, fields
+
+    if body.startswith(("PSY|","MKT|")):   # Heimdall / market scout
+        kind = "market"
+        parts = body.split("|")[1:]  # drop "PSY" token
+        fields = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                fields[k] = v
+        return kind, fields
+
+    raise ValueError("unknown format")
+
+def sec_ok(fields: dict) -> bool:
+    # If a 'sec' is present in the payload, enforce it; otherwise pass (URL token still required).
+    if "sec" in fields:
+        return fields["sec"] == SHARED_SEC
+    return True
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "ts": utc_ms(), "data_dir": DATA_DIR}
+
+@app.post("/ingest")
+async def ingest(request: Request, token: str):
+    # 1) URL token guard
     if token != URL_TOKEN:
-        raise HTTPException(401, "bad token")
-    raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-    d = parse_pipe(raw, "TELEM")  # must start with TELEM|
-    # optional shared-secret field
-    if BODY_SEC and d.get("sec") != BODY_SEC:
-        raise HTTPException(401, "bad secret")
-    # Required fields (see your TELEM pack)
-    # Minimal fallback: accept even if some optional fields missing
-    ts_ms = int(d.get("t", int(time.time()*1000)))
-    sym   = d.get("sym","?")
-    tf    = d.get("tf","?")
-    sig   = d.get("sig","?")       # EL/ES/XL/XS/XA
-    persona = d.get("sq") or d.get("p")
-    ag    = int(float(d.get("ag", "0")))
-    al    = float(d.get("al","0"))
-    hr    = float(d.get("atrx","0"))
-    ds    = float(d.get("d","0"))
-    sl    = float(d.get("sl","0"))
-    mx    = "UP" if d.get("m","0") in ("1","UP") else "DN"
-    rs    = d.get("reg","")
-    wr20  = float(d.get("wr20","-1")) if d.get("wr20") else None
+        raise HTTPException(status_code=401, detail="bad token")
 
-    conn = db()
-    conn.execute("""INSERT INTO trades(ts_ms,sym,tf,verb,persona,ag,al,hr,ds,sl,mx,rs,wr20,raw)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (ts_ms,sym,tf,sig,persona,ag,al,hr,ds,sl,mx,rs,wr20,raw))
-    conn.commit(); conn.close()
-    return JSONResponse({"ok": True})
+    # 2) Read and parse body
+    raw = (await request.body()).decode("utf-8", errors="ignore")
+    kind, fields = parse_pipe(raw)
 
-# -------- PSY / Heimdall (market) --------
-@app.post("/psy")
-async def psy_ingest(request: Request, token: str):
-    if token != URL_TOKEN:
-        raise HTTPException(401, "bad token")
-    raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-    d = parse_pipe(raw, "PSY")  # must start with PSY|
-    # optional shared-secret field if you add it in Pine
-    if "sec" in d and BODY_SEC and d["sec"] != BODY_SEC:
-        raise HTTPException(401, "bad secret")
+    # 3) Optional shared secret (if present)
+    if not sec_ok(fields):
+        raise HTTPException(status_code=401, detail="bad secret")
 
-    ts_ms = int(time.time()*1000)  # Heimdall doesn’t send time; we stamp server time
-    sym   = d.get("sym","?")
-    tf    = d.get("tf","?")
-    al    = float(d.get("al","0"))
-    hr    = float(d.get("hr","0"))
-    adx   = float(d.get("adx","0"))
-    bb    = float(d.get("bb","0"))
-    liq   = float(d.get("liq","0"))
-    spr   = float(d.get("spr","0"))
-    mx    = d.get("mx","na")
-    rg    = d.get("rg","na")
-    sess  = d.get("sess","ALL")
-    fp    = d.get("fp","")
+    # 4) Normalize minimal fields
+    ts = utc_ms()
+    sym = fields.get("sym", fields.get("symbol", "NA"))
+    tf  = fields.get("tf", "NA")
 
-    conn = db()
-    conn.execute("""INSERT INTO market(ts_ms,sym,tf,al,hr,adx,bb,liq,spr,mx,rg,sess,fp,raw)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (ts_ms,sym,tf,al,hr,adx,bb,liq,spr,mx,rg,sess,fp,raw))
-    conn.commit(); conn.close()
-    return JSONResponse({"ok": True})
+    if kind == "trade":
+        # trades table columns
+        hdr = ["ts_utc","sym","tf","verb","persona","ag","al","hr","ds","sl","mx","rs","wr20","raw"]
+        row = [
+            ts, sym, tf,
+            fields.get("verb","NA"),
+            fields.get("p",""),
+            fields.get("ag",""),
+            fields.get("al",""),
+            fields.get("hr",""),
+            fields.get("ds",""),
+            fields.get("sl",""),
+            fields.get("mx",""),
+            fields.get("rs",""),
+            fields.get("wr20",""),
+            raw
+        ]
+        append_row(csv_path("trades"), hdr, row)
+        return {"ok": True, "kind": "trade", "sym": sym, "tf": tf}
 
-# --------- tiny metrics for quick checks ----------
-@app.get("/metrics/psy_last")
-def psy_last(sym: str, tf: str):
-    conn = db()
-    row = conn.execute("""SELECT ts_ms, al, hr, adx, bb, liq, spr, mx, rg, sess, fp
-                          FROM market
-                          WHERE sym=? AND tf=?
-                          ORDER BY ts_ms DESC LIMIT 1""", (sym, tf)).fetchone()
-    conn.close()
-    if not row: raise HTTPException(404, "no data")
-    keys = ["ts_ms","al","hr","adx","bb","liq","spr","mx","rg","sess","fp"]
-    return dict(zip(keys,row))
-
-@app.get("/metrics/rollup")
-def rollup(sym: str = "", minutes: int = 60):
-    since = int(time.time()*1000) - minutes*60*1000
-    conn = db()
-    if sym:
-        cnt = conn.execute("""SELECT COUNT(*) FROM market WHERE sym=? AND ts_ms>=?""",(sym,since)).fetchone()[0]
     else:
-        cnt = conn.execute("""SELECT COUNT(*) FROM market WHERE ts_ms>=?""",(since,)).fetchone()[0]
-    conn.close()
-    return {"since_ms": since, "count": cnt, "sym": sym or "*"}
+        # market table columns (Heimdall / PSY)
+        hdr = ["ts_utc","sym","tf","al","hr","adx","bb","liq","spr","mx","rg","sess","fp","raw"]
+        row = [
+            ts, sym, tf,
+            fields.get("al",""),
+            fields.get("hr",""),
+            fields.get("adx",""),
+            fields.get("bb",""),
+            fields.get("liq",""),
+            fields.get("spr",""),
+            fields.get("mx",""),
+            fields.get("rg",""),
+            fields.get("sess",""),
+            fields.get("fp",""),
+            raw
+        ]
+        append_row(csv_path("market"), hdr, row)
+        return {"ok": True, "kind": "market", "sym": sym, "tf": tf}
+
+# --- quick CSV download endpoints ---
+@app.get("/export/{table}/today.csv")
+def export_today(table: str):
+    if table not in ("trades","market"):
+        raise HTTPException(404, "bad table")
+    path = csv_path(table)
+    if not os.path.exists(path):
+        raise HTTPException(404, "no data for today")
+    with open(path, "rb") as f:
+        data = f.read()
+    return Response(content=data, media_type="text/csv")
+
+# --- Excel workbook with both sheets (if pandas available) ---
+@app.get("/export/xlsx")
+def export_xlsx():
+    if not HAVE_PD:
+        raise HTTPException(501, "pandas/openpyxl not installed")
+    out = io.BytesIO()
+    writer = pd.ExcelWriter(out, engine="openpyxl")
+    for table in ("trades","market"):
+        path = csv_path(table)
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            df.to_excel(writer, sheet_name=table, index=False)
+    writer.close()
+    out.seek(0)
+    return StreamingResponse(out, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition":"attachment; filename=heimdall_today.xlsx"})
 
