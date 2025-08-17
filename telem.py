@@ -1,115 +1,137 @@
-
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 import sqlite3, time, os
 
-# ---------- Config via environment variables ----------
-DB_PATH = os.environ.get("TELEM_DB", "telem.db")
+DB_PATH   = os.environ.get("TELEM_DB", "telem.db")
 URL_TOKEN = os.environ.get("TELEM_URL_TOKEN", "set-a-long-random-token")
-SHARED_SECRET = os.environ.get("TELEM_SECRET", "CHANGE_ME")
+BODY_SEC  = os.environ.get("TELEM_SECRET",       "CHANGE_ME")
 
-app = FastAPI(title="F34 GPS — Telemetry Receiver", version="2.0")
+app = FastAPI()
 
-# ---------- DB helpers ----------
-def _db():
+def db():
     conn = sqlite3.connect(DB_PATH)
-    # keep rows returned as tuples, AUTOINCREMENT is fine for small write volume
-    conn.execute("""CREATE TABLE IF NOT EXISTS telemetry(
+    # Trades (from strategy order comments: TELEM_TRADE)
+    conn.execute("""CREATE TABLE IF NOT EXISTS trades(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        ts_ms INTEGER, sym TEXT, tf TEXT, sq TEXT,
-        reg TEXT, m INTEGER, sc REAL, d REAL, al REAL, atrx REAL,
-        sig TEXT, raw TEXT, inserted_at INTEGER
+        ts_ms INTEGER NOT NULL,
+        sym TEXT NOT NULL, tf TEXT NOT NULL, verb TEXT NOT NULL,  -- EL/ES/XL/XS/XA
+        persona TEXT, ag INTEGER, al REAL, hr REAL, ds REAL, sl REAL,
+        mx TEXT, rs TEXT, wr20 REAL, raw TEXT
     )""")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_ts     ON telemetry(ts_ms)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_sym_tf ON telemetry(sym, tf)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_trades_sym_tf_ts ON trades(sym, tf, ts_ms)")
+    # Market snapshots (from Heimdall / PSY)
+    conn.execute("""CREATE TABLE IF NOT EXISTS market(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts_ms INTEGER NOT NULL,
+        sym TEXT NOT NULL, tf TEXT NOT NULL,
+        al REAL, hr REAL, adx REAL, bb REAL, liq REAL, spr REAL,
+        mx TEXT, rg TEXT, sess TEXT, fp TEXT, raw TEXT
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_market_sym_tf_ts ON market(sym, tf, ts_ms)")
     return conn
 
-def parse_telem(raw: str) -> dict:
-    """
-    Parse compact pipe-delimited body.
-    Example:
-    TELEM|v=2|sym=KUCOIN:SOLUSDT|tf=1|t=1723824000000|sq=C|reg=X|m=1|sc=12.3|d=2.1|al=7.0|atrx=1.12|sig=HB|sec=SECRET
-    """
-    if not raw.startswith("TELEM|"):
-        raise ValueError("bad prefix")
+def parse_pipe(raw: str, expect_prefix: str):
+    raw = raw.strip()
+    if not raw.startswith(expect_prefix + "|"):
+        raise ValueError(f"bad prefix: expected {expect_prefix}")
     out = {}
-    for chunk in raw.strip().split("|")[1:]:
+    # First chunk is the prefix, the rest k=v or tokens
+    for chunk in raw.split("|")[1:]:
         if "=" in chunk:
             k, v = chunk.split("=", 1)
             out[k] = v
     return out
 
-# ---------- Routes ----------
 @app.get("/health")
 def health():
-    return {"ok": True, "service": "f34-gps", "time_ms": int(time.time()*1000)}
+    return {"ok": True, "db": DB_PATH}
 
+# -------- TELEM (orders) --------
 @app.post("/telem")
 async def telem_ingest(request: Request, token: str):
-    # URL token check
     if token != URL_TOKEN:
         raise HTTPException(401, "bad token")
-    # Raw body (TradingView sends text/plain)
     raw = (await request.body()).decode("utf-8", errors="ignore").strip()
-    if not raw:
-        raise HTTPException(400, "empty body")
-    try:
-        d = parse_telem(raw)
-    except Exception as e:
-        raise HTTPException(400, f"parse error: {e}")
-    # Shared-secret check (from Pine input)
-    if d.get("sec") != SHARED_SECRET:
+    d = parse_pipe(raw, "TELEM")  # must start with TELEM|
+    # optional shared-secret field
+    if BODY_SEC and d.get("sec") != BODY_SEC:
         raise HTTPException(401, "bad secret")
+    # Required fields (see your TELEM pack)
+    # Minimal fallback: accept even if some optional fields missing
+    ts_ms = int(d.get("t", int(time.time()*1000)))
+    sym   = d.get("sym","?")
+    tf    = d.get("tf","?")
+    sig   = d.get("sig","?")       # EL/ES/XL/XS/XA
+    persona = d.get("sq") or d.get("p")
+    ag    = int(float(d.get("ag", "0")))
+    al    = float(d.get("al","0"))
+    hr    = float(d.get("atrx","0"))
+    ds    = float(d.get("d","0"))
+    sl    = float(d.get("sl","0"))
+    mx    = "UP" if d.get("m","0") in ("1","UP") else "DN"
+    rs    = d.get("reg","")
+    wr20  = float(d.get("wr20","-1")) if d.get("wr20") else None
 
-    # Minimal validation
-    required = ["v","sym","tf","t","sq","reg","m","sc","d","al","atrx","sig"]
-    missing = [k for k in required if k not in d]
-    if missing:
-        raise HTTPException(400, f"missing fields: {','.join(missing)}")
-
-    conn = _db()
-    try:
-        conn.execute(
-            """INSERT INTO telemetry(ts_ms,sym,tf,sq,reg,m,sc,d,al,atrx,sig,raw,inserted_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (int(d["t"]), d["sym"], d["tf"], d["sq"], d["reg"], int(d["m"]),
-             float(d["sc"]), float(d["d"]), float(d["al"]), float(d["atrx"]),
-             d["sig"], raw, int(time.time()*1000))
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    conn = db()
+    conn.execute("""INSERT INTO trades(ts_ms,sym,tf,verb,persona,ag,al,hr,ds,sl,mx,rs,wr20,raw)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ts_ms,sym,tf,sig,persona,ag,al,hr,ds,sl,mx,rs,wr20,raw))
+    conn.commit(); conn.close()
     return JSONResponse({"ok": True})
 
-@app.get("/metrics/heartbeat")
-def last_heartbeat(sym: str, tf: str):
-    conn = _db()
-    try:
-        row = conn.execute(
-            """SELECT ts_ms, sq, reg, m, sc, d, al, atrx, sig
-               FROM telemetry WHERE sym=? AND tf=? ORDER BY ts_ms DESC LIMIT 1""",
-            (sym, tf)
-        ).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        raise HTTPException(404, "no data")
-    keys = ["ts_ms","sq","reg","m","sc","d","al","atrx","sig"]
-    return dict(zip(keys, row))
+# -------- PSY / Heimdall (market) --------
+@app.post("/psy")
+async def psy_ingest(request: Request, token: str):
+    if token != URL_TOKEN:
+        raise HTTPException(401, "bad token")
+    raw = (await request.body()).decode("utf-8", errors="ignore").strip()
+    d = parse_pipe(raw, "PSY")  # must start with PSY|
+    # optional shared-secret field if you add it in Pine
+    if "sec" in d and BODY_SEC and d["sec"] != BODY_SEC:
+        raise HTTPException(401, "bad secret")
+
+    ts_ms = int(time.time()*1000)  # Heimdall doesn’t send time; we stamp server time
+    sym   = d.get("sym","?")
+    tf    = d.get("tf","?")
+    al    = float(d.get("al","0"))
+    hr    = float(d.get("hr","0"))
+    adx   = float(d.get("adx","0"))
+    bb    = float(d.get("bb","0"))
+    liq   = float(d.get("liq","0"))
+    spr   = float(d.get("spr","0"))
+    mx    = d.get("mx","na")
+    rg    = d.get("rg","na")
+    sess  = d.get("sess","ALL")
+    fp    = d.get("fp","")
+
+    conn = db()
+    conn.execute("""INSERT INTO market(ts_ms,sym,tf,al,hr,adx,bb,liq,spr,mx,rg,sess,fp,raw)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (ts_ms,sym,tf,al,hr,adx,bb,liq,spr,mx,rg,sess,fp,raw))
+    conn.commit(); conn.close()
+    return JSONResponse({"ok": True})
+
+# --------- tiny metrics for quick checks ----------
+@app.get("/metrics/psy_last")
+def psy_last(sym: str, tf: str):
+    conn = db()
+    row = conn.execute("""SELECT ts_ms, al, hr, adx, bb, liq, spr, mx, rg, sess, fp
+                          FROM market
+                          WHERE sym=? AND tf=?
+                          ORDER BY ts_ms DESC LIMIT 1""", (sym, tf)).fetchone()
+    conn.close()
+    if not row: raise HTTPException(404, "no data")
+    keys = ["ts_ms","al","hr","adx","bb","liq","spr","mx","rg","sess","fp"]
+    return dict(zip(keys,row))
 
 @app.get("/metrics/rollup")
-def rollup(sym: str, minutes: int = 60):
+def rollup(sym: str = "", minutes: int = 60):
     since = int(time.time()*1000) - minutes*60*1000
-    conn = _db()
-    try:
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM telemetry WHERE sym=? AND ts_ms>=?",
-            (sym, since)
-        ).fetchone()[0]
-        sigs = conn.execute(
-            "SELECT sig, COUNT(*) FROM telemetry WHERE sym=? AND ts_ms>=? GROUP BY sig",
-            (sym, since)
-        ).fetchall()
-    finally:
-        conn.close()
-    return {"since_ms": since, "count": cnt, "by_sig": dict(sigs)}
+    conn = db()
+    if sym:
+        cnt = conn.execute("""SELECT COUNT(*) FROM market WHERE sym=? AND ts_ms>=?""",(sym,since)).fetchone()[0]
+    else:
+        cnt = conn.execute("""SELECT COUNT(*) FROM market WHERE ts_ms>=?""",(since,)).fetchone()[0]
+    conn.close()
+    return {"since_ms": since, "count": cnt, "sym": sym or "*"}
+
