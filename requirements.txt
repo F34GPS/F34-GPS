@@ -1,5 +1,4 @@
-uvicorn
 fastapi
-pydantic
-pandas
-python-dateutil
+uvicorn
+python-dotenv
+requests
