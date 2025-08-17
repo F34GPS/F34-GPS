@@ -1,14 +1,13 @@
 services:
   - type: web
-    name: heimdall
+    name: F34-GPS
     env: python
-    plan: free   # or "starter", "standard" depending on your Render plan
     buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn telem:app --host 0.0.0.0 --port 10000"
     envVars:
-      - key: TELEMETRY_URL
-        sync: false
-      - key: TELEMETRY_SECRET
-        sync: false
-      - key: TELEMETRY_TOKEN
-        sync: false
+      - key: TELEM_URL
+        value: 0bb658f5cbaa696a882487a4fcb89bab
+      - key: TELEM_SECRET
+        value: c9a9f6748a941a4177c827c67155c975
+      - key: TELEM_TOKEN
+        value: sugarsecret123
