@@ -1,7 +1,2 @@
 fastapi
 uvicorn[standard]
-gunicorn
-pydantic
-aiosqlite
-python-dateutil
-pandas
